@@ -1,13 +1,26 @@
+using System.Text;
+using Azure.Messaging.ServiceBus;
+using Core.Entities;
+using Core.Repositories;
+using Newtonsoft.Json;
+
 var builder = WebApplication.CreateBuilder(args);
 
-// Add services to the container.
-// Learn more about configuring Swagger/OpenAPI at https://aka.ms/aspnetcore/swashbuckle
+builder.Configuration
+    .AddJsonFile("appsettings.json", optional: true, reloadOnChange: true)
+    .AddEnvironmentVariables();
+
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
+builder.Services.AddScoped<IOwnerRepository, OwnerRepository>();
+builder.Services.AddScoped<ITenantRepository, TenantRepository>();
+
 var app = builder.Build();
 
-// Configure the HTTP request pipeline.
+var connectionString = builder.Configuration.GetConnectionString("ServiceBusConnectionString") ?? string.Empty;
+var topicName = builder.Configuration["ServiceBusTopicName"] ?? string.Empty;
+
 if (app.Environment.IsDevelopment())
 {
     app.UseSwagger();
@@ -16,29 +29,45 @@ if (app.Environment.IsDevelopment())
 
 app.UseHttpsRedirection();
 
-var summaries = new[]
-{
-    "Freezing", "Bracing", "Chilly", "Cool", "Mild", "Warm", "Balmy", "Hot", "Sweltering", "Scorching"
-};
+app.MapPost("/bookingrequests", async Task<IResult> (BookingRequest bookingRequest, IOwnerRepository ownerRepository, ITenantRepository tenantRepository) =>
+    {
+        try
+        {
+            var sender = new ServiceBusClient(connectionString).CreateSender(topicName);
+            var owner = ownerRepository.GetByPropertyId(bookingRequest.PropertyId);
+            var tenant = tenantRepository.GetById(bookingRequest.TenantId);
+            var booking = new Booking
+            {
+                Request = bookingRequest,
+                OwnerName = owner.FullName,
+                TenantName = tenant.FullName
+            };
 
-app.MapGet("/weatherforecast", () =>
-{
-    var forecast =  Enumerable.Range(1, 5).Select(index =>
-        new WeatherForecast
-        (
-            DateOnly.FromDateTime(DateTime.Now.AddDays(index)),
-            Random.Shared.Next(-20, 55),
-            summaries[Random.Shared.Next(summaries.Length)]
-        ))
-        .ToArray();
-    return forecast;
-})
-.WithName("GetWeatherForecast")
-.WithOpenApi();
+            var message = new ServiceBusMessage(Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(booking)))
+            {
+                ApplicationProperties =
+                {
+                    { "tenantId", booking.Request.TenantId },
+                    { "propertyId", booking.Request.PropertyId },
+                    { "rentStart", booking.Request.RentStart },
+                    { "rentEnd", booking.Request.RentEnd },
+                    { "ownerName", booking.OwnerName },
+                    { "tenantName", booking.TenantName }
+                }
+            };
+
+            await sender.SendMessageAsync(message);
+            Console.WriteLine("Message posted successfully.");
+
+            return Results.Created();
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine(e);
+            throw;
+        }
+    })
+    .WithName("Bookings")
+    .WithOpenApi();
 
 app.Run();
-
-record WeatherForecast(DateOnly Date, int TemperatureC, string? Summary)
-{
-    public int TemperatureF => 32 + (int)(TemperatureC / 0.5556);
-}
